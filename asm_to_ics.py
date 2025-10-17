@@ -28,7 +28,7 @@ META_START_RE = re.compile(r'<meta[^>]+property=["\']event:start_time["\'][^>]+c
 MONTH = r'(January|February|March|April|May|June|July|August|September|October|November|December|Jan\.?|Feb\.?|Mar\.?|Apr\.?|May|Jun\.?|Jul\.?|Aug\.?|Sep\.?|Sept\.?|Oct\.?|Nov\.?|Dec\.?)'
 TIME12 = r'(\d{1,2})(?::(\d{2}))?\s*([AaPp][Mm])'
 DATE_TEXT_RE = re.compile(
-    rf'\b{MONTH}\s+(\d{{1,2}})(?:,\s*(\d{{4}}))?(?:\s*[•@\-–]\s*|\s+at\s+){TIME12}\b'
+     rf'\b{MONTH}\s+(\d{{1,2}})(?:,\s*(\d{{4}}))?(?:\s*[•@\-–\|]\s*|\s+at\s+){TIME12}\b'
 )
 
 MONTH_MAP = {
