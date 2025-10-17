@@ -22,6 +22,29 @@ JSON_LD_RE = re.compile(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(
 ITEMPROP_STARTDATE_RE = re.compile(r'itemprop=["\']startDate["\'][^>]*?(?:datetime=["\']([^"\']+)["\']|content=["\']([^"\']+)["\'])', re.I)
 TIME_TAG_RE = re.compile(r'<time[^>]+datetime=["\']([^"\']+)["\']', re.I)
 GENERIC_STARTDATE_RE = re.compile(r'"startDate"\s*:\s*["\']([^"\']+)["\']')
+META_START_RE = re.compile(r'<meta[^>]+property=["\']event:start_time["\'][^>]+content=["\']([^"\']+)["\']', re.I)
+
+# Loose text patterns like "October 25, 2025 @ 7:30 PM" or "Oct 25 • 7:30 PM"
+MONTH = r'(January|February|March|April|May|June|July|August|September|October|November|December|Jan\.?|Feb\.?|Mar\.?|Apr\.?|May|Jun\.?|Jul\.?|Aug\.?|Sep\.?|Sept\.?|Oct\.?|Nov\.?|Dec\.?)'
+TIME12 = r'(\d{1,2})(?::(\d{2}))?\s*([AaPp][Mm])'
+DATE_TEXT_RE = re.compile(
+    rf'\b{MONTH}\s+(\d{{1,2}})(?:,\s*(\d{{4}}))?(?:\s*[•@\-–]\s*|\s+at\s+){TIME12}\b'
+)
+
+MONTH_MAP = {
+    'January':1,'Jan.':1,'Jan':1,
+    'February':2,'Feb.':2,'Feb':2,
+    'March':3,'Mar.':3,'Mar':3,
+    'April':4,'Apr.':4,'Apr':4,
+    'May':5,
+    'June':6,'Jun.':6,'Jun':6,
+    'July':7,'Jul.':7,'Jul':7,
+    'August':8,'Aug.':8,'Aug':8,
+    'September':9,'Sep.':9,'Sept.':9,'Sep':9,'Sept':9,
+    'October':10,'Oct.':10,'Oct':10,
+    'November':11,'Nov.':11,'Nov':11,
+    'December':12,'Dec.':12,'Dec':12,
+}
 
 def now_ny(): return datetime.now(tz=SITE_TZ)
 
@@ -65,9 +88,7 @@ def collect_links_from_html(html: str) -> set[str]:
             href = urljoin(BASE, href)
         m = EVENT_HREF_RE.match(href)
         if m and "/events/amp/" not in href:
-            # Likely detail links look like /events/<slug>/
             out.add(href.split("?")[0].rstrip("/") + "/")
-    # Also pull from any JSON blobs embedded
     for m in EVENT_HREF_RE.finditer(html):
         href = m.group(0)
         if "/events/amp/" not in href:
@@ -84,37 +105,6 @@ def parse_json_ld(html: str):
         except Exception:
             pass
     return items
-
-def find_event_datetimes(html: str) -> tuple[list[datetime], str|None]:
-    dates = []
-    title = None
-    # JSON-LD
-    for block in parse_json_ld(html):
-        for node in walk(block):
-            t = str(node.get("@type",""))
-            if "Event" in t:
-                if not title and isinstance(node.get("name"), str):
-                    title = node["name"]
-                iso = node.get("startDate") or node.get("start") or node.get("startTime")
-                d = parse_iso_like(iso)
-                if d: dates.append(d)
-    if dates: return dates, title
-    # Microdata
-    for m in ITEMPROP_STARTDATE_RE.finditer(html):
-        iso = m.group(1) or m.group(2)
-        d = parse_iso_like(iso)
-        if d: dates.append(d)
-    if dates: return dates, title
-    # <time datetime=...>
-    for m in TIME_TAG_RE.finditer(html):
-        d = parse_iso_like(m.group(1))
-        if d: dates.append(d)
-    if dates: return dates, title
-    # generic JSON strings
-    for m in GENERIC_STARTDATE_RE.finditer(html):
-        d = parse_iso_like(m.group(1))
-        if d: dates.append(d)
-    return dates, title
 
 def walk(node):
     if isinstance(node, dict):
@@ -137,19 +127,58 @@ def parse_iso_like(iso: str|None) -> datetime|None:
     if dt.tzinfo is None: dt = dt.replace(tzinfo=SITE_TZ)
     return dt
 
-def build_ics(events: list[Event]) -> str:
-    lines = [
-        "BEGIN:VCALENDAR",
-        "VERSION:2.0",
-        "PRODID:-//asm-syracuse-ics v3//EN",
-        "CALSCALE:GREGORIAN",
-        "METHOD:PUBLISH",
-        "X-WR-CALNAME:ASM Syracuse",
-        "X-WR-TIMEZONE:America/New_York",
-    ]
-    for ev in events: lines.append(ev.to_ics())
-    lines.append("END:VCALENDAR")
-    return "\n".join(lines) + "\n"
+def find_event_datetimes(html: str) -> tuple[list[datetime], str|None]:
+    dates = []
+    title = None
+    # 1) JSON-LD
+    for block in parse_json_ld(html):
+        for node in walk(block):
+            t = str(node.get("@type",""))
+            if "Event" in t:
+                if not title and isinstance(node.get("name"), str):
+                    title = node["name"]
+                iso = node.get("startDate") or node.get("start") or node.get("startTime")
+                d = parse_iso_like(iso)
+                if d: dates.append(d)
+    if dates: return dates, title
+    # 2) itemprop
+    for m in ITEMPROP_STARTDATE_RE.finditer(html):
+        iso = m.group(1) or m.group(2)
+        d = parse_iso_like(iso)
+        if d: dates.append(d)
+    if dates: return dates, title
+    # 3) time tags
+    for m in TIME_TAG_RE.finditer(html):
+        d = parse_iso_like(m.group(1))
+        if d: dates.append(d)
+    if dates: return dates, title
+    # 4) meta
+    for m in META_START_RE.finditer(html):
+        d = parse_iso_like(m.group(1))
+        if d: dates.append(d)
+    if dates: return dates, title
+    # 5) generic JSON "startDate":"..."
+    for m in GENERIC_STARTDATE_RE.finditer(html):
+        d = parse_iso_like(m.group(1))
+        if d: dates.append(d)
+    if dates: return dates, title
+    # 6) visible text like "October 25, 2025 @ 7:30 PM"
+    text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+    for m in DATE_TEXT_RE.finditer(text):
+        mon_name = m.group(1)
+        day = int(m.group(2))
+        year = m.group(3)
+        h = int(m.group(4))
+        mm = int(m.group(5) or 0)
+        ampm = m.group(6).lower()
+        mon = MONTH_MAP.get(mon_name, None)
+        if not mon: continue
+        if ampm == "pm" and h != 12: h += 12
+        if ampm == "am" and h == 12: h = 0
+        y = int(year) if year else now_ny().year
+        dt = datetime(y, mon, day, h, mm, tzinfo=SITE_TZ)
+        dates.append(dt)
+    return dates, title
 
 def extract_title(html: str) -> str|None:
     m = re.search(r"<h1[^>]*>(.*?)</h1>", html, re.I|re.S)
@@ -163,36 +192,32 @@ def extract_title(html: str) -> str|None:
 
 def main():
     list_html = fetch(LIST_URL)
-    amp_html = ""
+    urls = collect_links_from_html(list_html)
     try:
         amp_html = fetch(AMP_URL)
+        urls |= collect_links_from_html(amp_html)
     except Exception:
         pass
 
-    # Gather links from both normal and AMP pages
-    urls = set()
-    urls |= collect_links_from_html(list_html)
-    urls |= collect_links_from_html(amp_html)
+    print(f"DEBUG: collected {len(urls)} event URLs")
+    for u in sorted(urls)[:30]:
+        print("URL:", u)
 
-    # If still nothing, try to build from JSON-LD on the list pages (some sites publish event arrays there)
     events = []
-    def add_events_from_page(html, page_url=None):
-        blocks = parse_json_ld(html)
-        for b in blocks:
-            for node in walk(b):
-                if str(node.get("@type","")).lower() == "event":
-                    name = node.get("name") or "ASM Syracuse Event"
-                    start = parse_iso_like(node.get("startDate") or node.get("start"))
-                    if not start: continue
-                    url = node.get("url") or page_url or LIST_URL
-                    if isinstance(url, dict): url = url.get("@id") or LIST_URL
-                    events.append(Event(name, start, url=url))
-
     if not urls:
-        add_events_from_page(list_html, LIST_URL)
-        add_events_from_page(amp_html, AMP_URL)
+        # As a fallback, try to parse events directly from list pages' JSON-LD
+        for html, page in ((list_html, LIST_URL), (amp_html if 'amp_html' in locals() else '', AMP_URL)):
+            for block in parse_json_ld(html or ""):
+                for node in walk(block):
+                    if str(node.get("@type","")).lower() == "event":
+                        name = node.get("name") or "ASM Syracuse Event"
+                        start = parse_iso_like(node.get("startDate") or node.get("start"))
+                        if start:
+                            url = node.get("url") or page
+                            if isinstance(url, dict): url = url.get("@id") or page
+                            events.append(Event(name, start, url=url))
 
-    # Visit each event page for definitive times
+    # Visit each event page
     for u in sorted(urls):
         try:
             html = fetch(u)
@@ -208,16 +233,20 @@ def main():
             if dt >= now_ny() - timedelta(days=1):
                 events.append(Event(title, dt, url=u))
 
-    # If still no events, emit a connection test VEVENT so subscribers can see the feed is live
     if not events:
+        # Emit a visible test event so subscribers can verify the feed is live
         start = now_ny() + timedelta(days=1, hours=9)
         events.append(Event("ASM Feed Connected — awaiting events", start, end=start + timedelta(hours=1), url=LIST_URL))
 
-    # sort & write
     events.sort(key=lambda e: e.start)
+
     with open("asm_calendar.ics", "w", encoding="utf-8") as f:
-        f.write(build_ics(events))
-    print(f"Wrote asm_calendar.ics with {len(events)} events (from {len(urls)} URLs).")
+        f.write(
+            "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//asm-syracuse-ics v4//EN\nCALSCALE:GREGORIAN\nMETHOD:PUBLISH\nX-WR-CALNAME:ASM Syracuse\nX-WR-TIMEZONE:America/New_York\n"
+            + "\n".join(ev.to_ics() for ev in events) +
+            "\nEND:VCALENDAR\n"
+        )
+    print(f"Wrote asm_calendar.ics with {len(events)} events.")
 
 if __name__ == "__main__":
     main()
