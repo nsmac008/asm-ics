@@ -103,8 +103,13 @@ def collect_events_from_jsonld(html: str) -> List[Tuple[str, datetime, str, str]
     return uniq
 
 def escape_ics(text: str) -> str:
-    return (text or "").replace("\", "\\").replace(";", "\;").replace(",", "\,").replace("\n", "\n")
-
+    return (
+        (text or "")
+        .replace("\\", "\\\\")
+        .replace(";", "\\;")
+        .replace(",", "\\,")
+        .replace("\n", "\\n")
+    )
 def to_ics(events, cal_name: str, prefix: str):
     lines = [
         "BEGIN:VCALENDAR",
