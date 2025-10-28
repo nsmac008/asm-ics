@@ -1,1 +1,44 @@
+name: Build & Publish Ticketmaster ICS
 
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: '13 * * * *'
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Generate ICS (War Memorial)
+        run: |
+          python tm_venue_to_ics.py --url 'https://www.ticketmaster.com/upstate-medical-university-arena-at-the-tickets-syracuse/venue/186' --out public/asm_warmemorial.ics --name 'Upstate Medical University Arena — Ticketmaster' --prefix 'War Memorial: '
+      - name: Generate ICS (Crouse Hinds)
+        run: |
+          python tm_venue_to_ics.py --url 'https://www.ticketmaster.com/the-oncenter-crouse-hinds-theater-tickets-syracuse/venue/184' --out public/oncenter_crousehinds.ics --name 'The Oncenter Crouse Hinds Theater — Ticketmaster' --prefix 'Oncenter: '
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
