@@ -1,169 +1,249 @@
 #!/usr/bin/env python3
+import hashlib
+import os
 import re
-import sys
-import uuid
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urljoin
+
 import requests
-from datetime import datetime, timedelta
 from bs4 import BeautifulSoup
 from dateutil import parser as dtparse
 from dateutil import tz
 
-# ------------
-# CONFIG
-# ------------
-SITE_TZ = tz.gettz("America/New_York")
-DEFAULT_EVENT_DURATION_HOURS = 2
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/124.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.ticketmaster.com/",
+TZ = tz.gettz("America/New_York")
+ASM_LIST = "https://www.asmsyracuse.com/events/index.cfm?th=oncenter"
+CRUNCH_SCHEDULE = "https://syracusecrunch.com/sports/mens-ice-hockey/schedule/2026-27"
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124 Safari/537.36"
+HEADERS = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}
+
+VENUES = {
+    "war": {
+        "needle": ("upstate medical", "war memorial"),
+        "prefix": "War Memorial: ",
+        "name": "War Memorial",
+        "outfile": "public/asm_warmemorial.ics",
+        "location": "Upstate Medical University Arena at The Oncenter War Memorial, 515 Montgomery St, Syracuse, NY 13202",
+    },
+    "crouse": {
+        "needle": ("crouse hinds",),
+        "prefix": "Oncenter: ",
+        "name": "Oncenter — Crouse Hinds Theater",
+        "outfile": "public/oncenter_crousehinds.ics",
+        "location": "The Oncenter Crouse Hinds Theater, 411 Montgomery St, Syracuse, NY 13202",
+    },
 }
 
-VENUES = [
-    {
-        "url": "https://www.ticketmaster.com/upstate-medical-university-arena-at-the-tickets-syracuse/venue/186",
-        "outfile": "public/asm_warmemorial.ics",
-        "prefix": "War Memorial: ",
-    },
-    {
-        "url": "https://www.ticketmaster.com/the-oncenter-crouse-hinds-theater-tickets-syracuse/venue/184",
-        "outfile": "public/oncenter_crousehinds.ics",
-        "prefix": "Oncenter: ",
-    },
-]
+DATE_TIME_RE = re.compile(
+    r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)?\w*\s*"
+    r"(?P<mon>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?\s+"
+    r"(?P<day>\d{1,2})(?:,)?\s+(?P<year>20\d{2})\s*\|?\s*"
+    r"(?P<hour>\d{1,2}):(?P<minute>\d{2})\s*(?P<ampm>AM|PM)",
+    re.I,
+)
 
 
-# ------------
-# HELPERS
-# ------------
-def escape_ics(text: str) -> str:
-    return (
-        (text or "")
-        .replace("\\", "\\\\")
-        .replace(";", "\\;")
-        .replace(",", "\\,")
-        .replace("\n", "\\n")
-    )
+def fetch(url):
+    r = requests.get(url, headers=HEADERS, timeout=35)
+    r.raise_for_status()
+    return r.text
 
 
-def fetch_html(url):
-    resp = requests.get(url, headers=HEADERS, timeout=25)
-    resp.raise_for_status()
-    return resp.text
+def esc(s):
+    return (s or "").replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\n", "\\n")
 
 
-def parse_ticketmaster_events(html, prefix):
+def uid_for(source, start, title):
+    raw = f"{source}|{start.isoformat()}|{title}".encode("utf-8")
+    return hashlib.sha1(raw).hexdigest() + "@nsmac008-venue-feed"
+
+
+def parse_dt(mon, day, year, hour, minute, ampm):
+    return dtparse.parse(f"{mon} {day} {year} {hour}:{minute} {ampm}").replace(tzinfo=TZ)
+
+
+def event_links_from_listing(html):
+    soup = BeautifulSoup(html, "html.parser")
+    links = set()
+    for a in soup.find_all("a", href=True):
+        href = urljoin(ASM_LIST, a["href"])
+        if re.search(r"/events/20\d{2}/", href, re.I):
+            links.add(href.split("?")[0].rstrip("/"))
+    return sorted(links)
+
+
+def parse_asm_detail(url, html):
+    soup = BeautifulSoup(html, "html.parser")
+    title_el = soup.find("h1")
+    title = title_el.get_text(" ", strip=True) if title_el else None
+    if not title:
+        return []
+
+    text = " ".join(soup.stripped_strings)
+    low = text.lower()
+    venue_key = None
+    for key, cfg in VENUES.items():
+        if any(n in low for n in cfg["needle"]):
+            venue_key = key
+            break
+    if not venue_key:
+        return []
+
+    starts = []
+    for m in DATE_TIME_RE.finditer(text):
+        dt = parse_dt(m.group("mon"), m.group("day"), m.group("year"), m.group("hour"), m.group("minute"), m.group("ampm"))
+        starts.append(dt)
+
+    # Fallback to explicit Date:/Time: text on ASM detail pages.
+    if not starts:
+        dm = re.search(r"Date:\s*([A-Za-z]{3,9}\.?\s+\d{1,2}(?:\s*-\s*[A-Za-z]{0,9}\.?\s*\d{1,2})?,?\s+20\d{2})", text, re.I)
+        tm = re.search(r"Time:\s*(\d{1,2}:\d{2}\s*(?:AM|PM))", text, re.I)
+        if dm and tm:
+            try:
+                first_date = re.split(r"\s+-\s+", dm.group(1))[0]
+                starts.append(dtparse.parse(f"{first_date} {tm.group(1)}").replace(tzinfo=TZ))
+            except Exception:
+                pass
+
+    # Keep unique future-ish performances.
+    cutoff = datetime.now(TZ) - timedelta(days=2)
+    unique = []
+    seen = set()
+    for start in starts:
+        if start < cutoff:
+            continue
+        key = start.isoformat()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append({
+            "title": title,
+            "start": start,
+            "end": start + timedelta(hours=3),
+            "url": url,
+            "venue": venue_key,
+            "location": VENUES[venue_key]["location"],
+        })
+    return unique
+
+
+def parse_crunch_home_games(html):
     soup = BeautifulSoup(html, "html.parser")
     events = []
+    cutoff = datetime.now(TZ) - timedelta(days=2)
 
-    cards = soup.select("div.event-listing, li.event-listing, a.event")
-    if not cards:
-        cards = soup.select("a[href*='/event/']")
-
+    # SIDEARM schedule cards are the most reliable structure when present.
+    cards = soup.select("li.sidearm-schedule-game, div.sidearm-schedule-game")
     for card in cards:
-        title_el = card.find(["h3", "h2"]) or card
-        title = title_el.get_text(strip=True) if title_el else None
-        if not title:
+        text = " ".join(card.stripped_strings)
+        if "Upstate Medical University Arena" not in text:
             continue
-        title = f"{prefix}{title}"
-
-        link = None
-        a = card.find("a", href=True)
-        if a and "/event/" in a["href"]:
-            link = a["href"]
-            if link.startswith("/"):
-                link = f"https://www.ticketmaster.com{link}"
-
-        date_el = card.find(["time", "span"], class_=re.compile("date", re.I))
-        date_txt = date_el.get_text(strip=True) if date_el else None
-        time_el = card.find(["span"], class_=re.compile("time", re.I))
-        time_txt = time_el.get_text(strip=True) if time_el else ""
-
-        if not date_txt:
+        date_el = card.select_one(".sidearm-schedule-game-opponent-date, .sidearm-schedule-game-opponent-date-flex")
+        opp_el = card.select_one(".sidearm-schedule-game-opponent-name")
+        date_text = date_el.get_text(" ", strip=True) if date_el else text
+        opponent = opp_el.get_text(" ", strip=True) if opp_el else "Syracuse Crunch Home Game"
+        m = re.search(r"(Oct|Nov|Dec|Jan|Feb|Mar|Apr)\.?\s+(\d{1,2}).*?(\d{1,2}(?::\d{2})?\s*(?:a\.m\.|p\.m\.|AM|PM))", date_text, re.I)
+        if not m:
             continue
-
-        dt = parse_date_time(date_txt, time_txt)
-        if not dt:
+        year = 2026 if m.group(1).lower() in ("oct", "nov", "dec") else 2027
+        try:
+            start = dtparse.parse(f"{m.group(1)} {m.group(2)} {year} {m.group(3).replace('.', '')}").replace(tzinfo=TZ)
+        except Exception:
             continue
-
-        end_dt = dt + timedelta(hours=DEFAULT_EVENT_DURATION_HOURS)
-        events.append(
-            {
-                "title": title,
-                "start": dt,
-                "end": end_dt,
-                "url": link,
-            }
-        )
-
+        if start < cutoff:
+            continue
+        url_el = card.find("a", href=True)
+        source = urljoin(CRUNCH_SCHEDULE, url_el["href"]) if url_el else CRUNCH_SCHEDULE
+        events.append({
+            "title": f"Syracuse Crunch vs. {opponent}" if not opponent.lower().startswith("syracuse") else opponent,
+            "start": start,
+            "end": start + timedelta(hours=3),
+            "url": source,
+            "venue": "war",
+            "location": VENUES["war"]["location"],
+        })
     return events
 
 
-def parse_date_time(date_str, time_str):
-    try:
-        base = dtparse.parse(date_str)
-        t = dtparse.parse(time_str) if time_str else None
-        if t:
-            base = base.replace(hour=t.hour, minute=t.minute)
-        return base.replace(tzinfo=SITE_TZ)
-    except Exception:
-        return None
+def dedupe(events):
+    out = []
+    seen = set()
+    for e in sorted(events, key=lambda x: x["start"]):
+        key = (e["venue"], e["start"].strftime("%Y%m%d%H%M"), re.sub(r"\W+", "", e["title"].lower()))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(e)
+    return out
 
 
-def write_ics(events, path, venue_name):
+def build_ics(events, cal_name, prefix=None):
+    now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     lines = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
-        f"PRODID:-//asm-ics//EN",
+        "PRODID:-//nsmac008//Syracuse Venue Feeds//EN",
         "CALSCALE:GREGORIAN",
         "METHOD:PUBLISH",
-        f"X-WR-CALNAME:{venue_name}",
+        f"X-WR-CALNAME:{esc(cal_name)}",
         "X-WR-TIMEZONE:America/New_York",
+        "REFRESH-INTERVAL;VALUE=DURATION:PT6H",
+        "X-PUBLISHED-TTL:PT6H",
     ]
-
-    for e in sorted(events, key=lambda x: x["start"]):
-        uid = f"{uuid.uuid4()}@asm-ics"
-        dtstamp = datetime.now(tz=tz.UTC).strftime("%Y%m%dT%H%M%SZ")
-        dtstart = e["start"].astimezone(tz.UTC).strftime("%Y%m%dT%H%M%SZ")
-        dtend = e["end"].astimezone(tz.UTC).strftime("%Y%m%dT%H%M%SZ")
-
-        lines.extend([
+    for e in events:
+        p = prefix if prefix is not None else VENUES[e["venue"]]["prefix"]
+        summary = p + e["title"]
+        start_utc = e["start"].astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        end_utc = e["end"].astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        lines += [
             "BEGIN:VEVENT",
-            f"UID:{uid}",
-            f"DTSTAMP:{dtstamp}",
-            f"DTSTART:{dtstart}",
-            f"DTEND:{dtend}",
-            f"SUMMARY:{escape_ics(e['title'])}",
-        ])
-        if e["url"]:
-            lines.append(f"URL:{escape_ics(e['url'])}")
-        lines.append("END:VEVENT")
-
+            f"UID:{uid_for(e['url'], e['start'], e['title'])}",
+            f"DTSTAMP:{now}",
+            f"DTSTART:{start_utc}",
+            f"DTEND:{end_utc}",
+            f"SUMMARY:{esc(summary)}",
+            f"LOCATION:{esc(e['location'])}",
+            f"URL:{esc(e['url'])}",
+            f"DESCRIPTION:{esc('Source: ' + e['url'])}",
+            "STATUS:CONFIRMED",
+            "END:VEVENT",
+        ]
     lines.append("END:VCALENDAR")
-
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-    print(f"Wrote {path} with {len(events)} events")
+    return "\r\n".join(lines) + "\r\n"
 
 
-# ------------
-# MAIN
-# ------------
+def write(path, content):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(content)
+
+
 def main():
-    for v in VENUES:
-        print(f"Fetching: {v['url']}")
+    events = []
+    listing = fetch(ASM_LIST)
+    links = event_links_from_listing(listing)
+    print(f"ASM event detail links found: {len(links)}")
+    for link in links:
         try:
-            html = fetch_html(v["url"])
-            events = parse_ticketmaster_events(html, v["prefix"])
-            if not events:
-                print(f"No events parsed for {v['url']}")
-                continue
-            write_ics(events, v["outfile"], v["prefix"].strip(": "))
-        except Exception as e:
-            print(f"Error parsing {v['url']}: {e}")
+            parsed = parse_asm_detail(link, fetch(link))
+            events.extend(parsed)
+        except Exception as exc:
+            print(f"WARN {link}: {exc}")
+
+    try:
+        events.extend(parse_crunch_home_games(fetch(CRUNCH_SCHEDULE)))
+    except Exception as exc:
+        print(f"WARN Crunch schedule: {exc}")
+
+    events = dedupe(events)
+    war = [e for e in events if e["venue"] == "war"]
+    crouse = [e for e in events if e["venue"] == "crouse"]
+    print(f"Parsed {len(war)} War Memorial and {len(crouse)} Crouse Hinds performances")
+
+    # Always create the files, even if a source temporarily yields zero events.
+    write(VENUES["war"]["outfile"], build_ics(war, "War Memorial" , "War Memorial: "))
+    write(VENUES["crouse"]["outfile"], build_ics(crouse, "Oncenter — Crouse Hinds Theater", "Oncenter: "))
+    # Backward-compatible combined URL used by the existing Google Calendar subscription.
+    write("public/asm_calendar.ics", build_ics(events, "ASM Syracuse — Venue Feed"))
 
 
 if __name__ == "__main__":
