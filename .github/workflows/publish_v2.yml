@@ -1,0 +1,56 @@
+name: Build & Publish Syracuse Venue ICS v2
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: '17 */3 * * *'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Generate venue calendars
+        run: python tm_venue_to_ics.py
+      - name: Validate generated calendars
+        run: |
+          set -e
+          for f in public/asm_calendar.ics public/asm_warmemorial.ics public/oncenter_crousehinds.ics; do
+            test -s "$f"
+            grep -q '^BEGIN:VCALENDAR' "$f"
+            grep -q '^END:VCALENDAR' "$f"
+            echo "$f: $(grep -c '^BEGIN:VEVENT' "$f") events"
+          done
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
