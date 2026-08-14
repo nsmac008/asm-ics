@@ -11,7 +11,7 @@ from dateutil import parser as dtparse
 from dateutil import tz
 
 TZ = tz.gettz("America/New_York")
-ASM_LIST = "https://www.asmsyracuse.com/events/index.cfm?th=oncenter"
+ASM_LIST = "https://www.syrvenues.com/events"
 CRUNCH_SCHEDULE = "https://syracusecrunch.com/sports/mens-ice-hockey/schedule/2026-27"
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124 Safari/537.36"
 HEADERS = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}
@@ -43,7 +43,7 @@ DATE_TIME_RE = re.compile(
 
 
 def fetch(url):
-    r = requests.get(url, headers=HEADERS, timeout=35)
+    r = requests.get(url, headers=HEADERS, timeout=35, allow_redirects=True)
     r.raise_for_status()
     return r.text
 
@@ -64,10 +64,17 @@ def parse_dt(mon, day, year, hour, minute, ampm):
 def event_links_from_listing(html):
     soup = BeautifulSoup(html, "html.parser")
     links = set()
+
+    # Primary path: normal anchors on the new syrvenues.com calendar.
     for a in soup.find_all("a", href=True):
         href = urljoin(ASM_LIST, a["href"])
-        if re.search(r"/events/20\d{2}/", href, re.I):
-            links.add(href.split("?")[0].rstrip("/"))
+        if re.search(r"https?://(?:www\.)?syrvenues\.com/events/20\d{2}/[^?#]+", href, re.I):
+            links.add(href.split("?")[0].split("#")[0].rstrip("/"))
+
+    # Fallback: scan raw HTML in case Saffire changes how the links are rendered.
+    for match in re.finditer(r"(?:https?://(?:www\.)?syrvenues\.com)?(/events/20\d{2}/[A-Za-z0-9_\-]+)", html, re.I):
+        links.add(urljoin(ASM_LIST, match.group(1)).rstrip("/"))
+
     return sorted(links)
 
 
@@ -90,21 +97,19 @@ def parse_asm_detail(url, html):
 
     starts = []
     for m in DATE_TIME_RE.finditer(text):
-        dt = parse_dt(m.group("mon"), m.group("day"), m.group("year"), m.group("hour"), m.group("minute"), m.group("ampm"))
-        starts.append(dt)
+        start = parse_dt(m.group("mon"), m.group("day"), m.group("year"), m.group("hour"), m.group("minute"), m.group("ampm"))
+        starts.append(start)
 
-    # Fallback to explicit Date:/Time: text on ASM detail pages.
+    # Fallback to the main Date:/Time: fields when there are no ticket-date entries.
     if not starts:
-        dm = re.search(r"Date:\s*([A-Za-z]{3,9}\.?\s+\d{1,2}(?:\s*-\s*[A-Za-z]{0,9}\.?\s*\d{1,2})?,?\s+20\d{2})", text, re.I)
+        dm = re.search(r"Date:\s*([A-Za-z]{3,9}\.?\s+\d{1,2},?\s+20\d{2})", text, re.I)
         tm = re.search(r"Time:\s*(\d{1,2}:\d{2}\s*(?:AM|PM))", text, re.I)
         if dm and tm:
             try:
-                first_date = re.split(r"\s+-\s+", dm.group(1))[0]
-                starts.append(dtparse.parse(f"{first_date} {tm.group(1)}").replace(tzinfo=TZ))
+                starts.append(dtparse.parse(f"{dm.group(1)} {tm.group(1)}").replace(tzinfo=TZ))
             except Exception:
                 pass
 
-    # Keep unique future-ish performances.
     cutoff = datetime.now(TZ) - timedelta(days=2)
     unique = []
     seen = set()
@@ -130,8 +135,6 @@ def parse_crunch_home_games(html):
     soup = BeautifulSoup(html, "html.parser")
     events = []
     cutoff = datetime.now(TZ) - timedelta(days=2)
-
-    # SIDEARM schedule cards are the most reliable structure when present.
     cards = soup.select("li.sidearm-schedule-game, div.sidearm-schedule-game")
     for card in cards:
         text = " ".join(card.stripped_strings)
@@ -221,11 +224,10 @@ def main():
     events = []
     listing = fetch(ASM_LIST)
     links = event_links_from_listing(listing)
-    print(f"ASM event detail links found: {len(links)}")
+    print(f"Syracuse venue event detail links found: {len(links)}")
     for link in links:
         try:
-            parsed = parse_asm_detail(link, fetch(link))
-            events.extend(parsed)
+            events.extend(parse_asm_detail(link, fetch(link)))
         except Exception as exc:
             print(f"WARN {link}: {exc}")
 
@@ -239,10 +241,8 @@ def main():
     crouse = [e for e in events if e["venue"] == "crouse"]
     print(f"Parsed {len(war)} War Memorial and {len(crouse)} Crouse Hinds performances")
 
-    # Always create the files, even if a source temporarily yields zero events.
-    write(VENUES["war"]["outfile"], build_ics(war, "War Memorial" , "War Memorial: "))
+    write(VENUES["war"]["outfile"], build_ics(war, "War Memorial", "War Memorial: "))
     write(VENUES["crouse"]["outfile"], build_ics(crouse, "Oncenter — Crouse Hinds Theater", "Oncenter: "))
-    # Backward-compatible combined URL used by the existing Google Calendar subscription.
     write("public/asm_calendar.ics", build_ics(events, "ASM Syracuse — Venue Feed"))
 
 
