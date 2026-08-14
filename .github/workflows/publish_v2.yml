@@ -34,8 +34,11 @@ jobs:
             test -s "$f"
             grep -q '^BEGIN:VCALENDAR' "$f"
             grep -q '^END:VCALENDAR' "$f"
-            echo "$f: $(grep -c '^BEGIN:VEVENT' "$f") events"
+            count=$(grep -c '^BEGIN:VEVENT' "$f" || true)
+            echo "$f: $count events"
           done
+          test "$(grep -c '^BEGIN:VEVENT' public/asm_warmemorial.ics || true)" -gt 0
+          test "$(grep -c '^BEGIN:VEVENT' public/oncenter_crousehinds.ics || true)" -gt 0
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
