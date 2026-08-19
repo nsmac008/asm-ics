@@ -11,20 +11,23 @@ from dateutil import parser as dtparse
 from dateutil import tz
 
 TZ = tz.gettz("America/New_York")
-ASM_LIST = "https://www.syrvenues.com/events"
+BASE = "https://www.syrvenues.com"
+EVENTS_URL = BASE + "/events"
 CRUNCH_SCHEDULE = "https://syracusecrunch.com/sports/mens-ice-hockey/schedule/2026-27"
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124 Safari/537.36"
 HEADERS = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}
 
 VENUES = {
     "war": {
-        "needle": ("upstate medical", "war memorial"),
+        "page": BASE + "/location/upstate-medical-arena-at-the-oncenter-war-memorial",
+        "needle": ("upstate medical arena", "war memorial"),
         "prefix": "War Memorial: ",
         "name": "War Memorial",
         "outfile": "public/asm_warmemorial.ics",
         "location": "Upstate Medical University Arena at The Oncenter War Memorial, 515 Montgomery St, Syracuse, NY 13202",
     },
     "crouse": {
+        "page": BASE + "/location/the-oncenter-crouse-hinds-theater",
         "needle": ("crouse hinds",),
         "prefix": "Oncenter: ",
         "name": "Oncenter — Crouse Hinds Theater",
@@ -33,10 +36,10 @@ VENUES = {
     },
 }
 
-DATE_TIME_RE = re.compile(
-    r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)?\w*\s*"
+EVENT_URL_RE = re.compile(r"https?://(?:www\.)?syrvenues\.com/events/20\d{2}/[A-Za-z0-9_\-]+", re.I)
+PERFORMANCE_RE = re.compile(
     r"(?P<mon>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?\s+"
-    r"(?P<day>\d{1,2})(?:,)?\s+(?P<year>20\d{2})\s*\|?\s*"
+    r"(?P<day>\d{1,2}),?\s+(?P<year>20\d{2})\s*(?:\||[-–—])?\s*"
     r"(?P<hour>\d{1,2}):(?P<minute>\d{2})\s*(?P<ampm>AM|PM)",
     re.I,
 )
@@ -44,6 +47,16 @@ DATE_TIME_RE = re.compile(
 
 def fetch(url):
     r = requests.get(url, headers=HEADERS, timeout=35, allow_redirects=True)
+    r.raise_for_status()
+    return r.text
+
+
+def mirror_url(url):
+    return "https://r.jina.ai/http://" + re.sub(r"^https?://", "", url)
+
+
+def fetch_mirror(url):
+    r = requests.get(mirror_url(url), headers={"User-Agent": UA}, timeout=45)
     r.raise_for_status()
     return r.text
 
@@ -57,50 +70,96 @@ def uid_for(source, start, title):
     return hashlib.sha1(raw).hexdigest() + "@nsmac008-venue-feed"
 
 
-def parse_dt(mon, day, year, hour, minute, ampm):
-    return dtparse.parse(f"{mon} {day} {year} {hour}:{minute} {ampm}").replace(tzinfo=TZ)
+def normalize_event_url(value):
+    if not value:
+        return None
+    if value.startswith("/"):
+        value = urljoin(BASE, value)
+    m = EVENT_URL_RE.search(value)
+    return m.group(0).rstrip("/") if m else None
 
 
-def event_links_from_listing(html):
-    soup = BeautifulSoup(html, "html.parser")
+def links_from_html(html):
     links = set()
-
-    # Primary path: normal anchors on the new syrvenues.com calendar.
+    soup = BeautifulSoup(html, "html.parser")
     for a in soup.find_all("a", href=True):
-        href = urljoin(ASM_LIST, a["href"])
-        if re.search(r"https?://(?:www\.)?syrvenues\.com/events/20\d{2}/[^?#]+", href, re.I):
-            links.add(href.split("?")[0].split("#")[0].rstrip("/"))
+        u = normalize_event_url(urljoin(BASE, a["href"]))
+        if u:
+            links.add(u)
+    for m in re.finditer(r"(?:https?://(?:www\.)?syrvenues\.com)?(/events/20\d{2}/[A-Za-z0-9_\-]+)", html, re.I):
+        u = normalize_event_url(urljoin(BASE, m.group(1)))
+        if u:
+            links.add(u)
+    return links
 
-    # Fallback: scan raw HTML in case Saffire changes how the links are rendered.
-    for match in re.finditer(r"(?:https?://(?:www\.)?syrvenues\.com)?(/events/20\d{2}/[A-Za-z0-9_\-]+)", html, re.I):
-        links.add(urljoin(ASM_LIST, match.group(1)).rstrip("/"))
 
+def links_from_mirror(text):
+    links = set(EVENT_URL_RE.findall(text))
+    for m in re.finditer(r"\]\((/events/20\d{2}/[A-Za-z0-9_\-]+)\)", text, re.I):
+        links.add(urljoin(BASE, m.group(1)))
+    return {u.rstrip("/") for u in links}
+
+
+def discover_event_links():
+    links = set()
+    sources = [EVENTS_URL] + [cfg["page"] for cfg in VENUES.values()]
+    for source in sources:
+        direct_links = set()
+        try:
+            direct = fetch(source)
+            direct_links = links_from_html(direct)
+            links.update(direct_links)
+        except Exception as exc:
+            print(f"WARN direct discovery {source}: {exc}")
+        if not direct_links:
+            try:
+                mirrored = fetch_mirror(source)
+                found = links_from_mirror(mirrored)
+                links.update(found)
+                print(f"Mirror discovery {source}: {len(found)} links")
+            except Exception as exc:
+                print(f"WARN mirror discovery {source}: {exc}")
     return sorted(links)
 
 
-def parse_asm_detail(url, html):
-    soup = BeautifulSoup(html, "html.parser")
-    title_el = soup.find("h1")
-    title = title_el.get_text(" ", strip=True) if title_el else None
-    if not title:
-        return []
+def page_text(html):
+    return " ".join(BeautifulSoup(html, "html.parser").stripped_strings)
 
-    text = " ".join(soup.stripped_strings)
+
+def title_from_content(content, is_html=True):
+    if is_html:
+        soup = BeautifulSoup(content, "html.parser")
+        h1 = soup.find("h1")
+        if h1:
+            return h1.get_text(" ", strip=True)
+    for line in content.splitlines():
+        line = line.strip()
+        if line.startswith("# "):
+            return line[2:].strip()
+    return None
+
+
+def venue_from_text(text):
     low = text.lower()
-    venue_key = None
     for key, cfg in VENUES.items():
         if any(n in low for n in cfg["needle"]):
-            venue_key = key
-            break
-    if not venue_key:
-        return []
+            return key
+    return None
 
+
+def parse_performances(text):
     starts = []
-    for m in DATE_TIME_RE.finditer(text):
-        start = parse_dt(m.group("mon"), m.group("day"), m.group("year"), m.group("hour"), m.group("minute"), m.group("ampm"))
-        starts.append(start)
+    for m in PERFORMANCE_RE.finditer(text):
+        try:
+            dt = dtparse.parse(
+                f"{m.group('mon')} {m.group('day')} {m.group('year')} "
+                f"{m.group('hour')}:{m.group('minute')} {m.group('ampm')}"
+            ).replace(tzinfo=TZ)
+            starts.append(dt)
+        except Exception:
+            pass
 
-    # Fallback to the main Date:/Time: fields when there are no ticket-date entries.
+    # Main Date:/Time: fields catch simple one-performance pages.
     if not starts:
         dm = re.search(r"Date:\s*([A-Za-z]{3,9}\.?\s+\d{1,2},?\s+20\d{2})", text, re.I)
         tm = re.search(r"Time:\s*(\d{1,2}:\d{2}\s*(?:AM|PM))", text, re.I)
@@ -111,24 +170,64 @@ def parse_asm_detail(url, html):
                 pass
 
     cutoff = datetime.now(TZ) - timedelta(days=2)
-    unique = []
+    out = []
     seen = set()
-    for start in starts:
-        if start < cutoff:
+    for dt in sorted(starts):
+        if dt < cutoff:
             continue
-        key = start.isoformat()
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append({
+        key = dt.isoformat()
+        if key not in seen:
+            seen.add(key)
+            out.append(dt)
+    return out
+
+
+def parse_event_detail(url):
+    content = None
+    is_html = True
+    try:
+        content = fetch(url)
+    except Exception as exc:
+        print(f"WARN direct detail {url}: {exc}")
+    if content:
+        text = page_text(content)
+        title = title_from_content(content, True)
+        venue = venue_from_text(text)
+        starts = parse_performances(text)
+        if title and venue and starts:
+            return make_events(url, title, venue, starts)
+
+    try:
+        content = fetch_mirror(url)
+        is_html = False
+    except Exception as exc:
+        print(f"WARN mirror detail {url}: {exc}")
+        return []
+
+    text = " ".join(content.split())
+    title = title_from_content(content, is_html)
+    venue = venue_from_text(text)
+    starts = parse_performances(text)
+    if not title or not venue or not starts:
+        return []
+    return make_events(url, title, venue, starts)
+
+
+def make_events(url, title, venue, starts):
+    low_title = title.lower()
+    if "cancelled" in low_title or "canceled" in low_title or "postponed" in low_title:
+        return []
+    return [
+        {
             "title": title,
             "start": start,
             "end": start + timedelta(hours=3),
             "url": url,
-            "venue": venue_key,
-            "location": VENUES[venue_key]["location"],
-        })
-    return unique
+            "venue": venue,
+            "location": VENUES[venue]["location"],
+        }
+        for start in starts
+    ]
 
 
 def parse_crunch_home_games(html):
@@ -222,17 +321,21 @@ def write(path, content):
 
 def main():
     events = []
-    listing = fetch(ASM_LIST)
-    links = event_links_from_listing(listing)
+    links = discover_event_links()
     print(f"Syracuse venue event detail links found: {len(links)}")
     for link in links:
         try:
-            events.extend(parse_asm_detail(link, fetch(link)))
+            parsed = parse_event_detail(link)
+            if parsed:
+                print(f"  {link}: {len(parsed)} performance(s), venue={parsed[0]['venue']}")
+            events.extend(parsed)
         except Exception as exc:
             print(f"WARN {link}: {exc}")
 
     try:
-        events.extend(parse_crunch_home_games(fetch(CRUNCH_SCHEDULE)))
+        crunch = parse_crunch_home_games(fetch(CRUNCH_SCHEDULE))
+        print(f"Crunch home games found: {len(crunch)}")
+        events.extend(crunch)
     except Exception as exc:
         print(f"WARN Crunch schedule: {exc}")
 
