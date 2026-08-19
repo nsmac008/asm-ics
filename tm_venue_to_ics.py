@@ -20,7 +20,6 @@ HEADERS = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}
 VENUES = {
     "war": {
         "page": BASE + "/location/upstate-medical-arena-at-the-oncenter-war-memorial",
-        "needle": ("upstate medical arena", "war memorial"),
         "prefix": "War Memorial: ",
         "name": "War Memorial",
         "outfile": "public/asm_warmemorial.ics",
@@ -28,7 +27,6 @@ VENUES = {
     },
     "crouse": {
         "page": BASE + "/location/the-oncenter-crouse-hinds-theater",
-        "needle": ("crouse hinds",),
         "prefix": "Oncenter: ",
         "name": "Oncenter — Crouse Hinds Theater",
         "outfile": "public/oncenter_crousehinds.ics",
@@ -36,10 +34,10 @@ VENUES = {
     },
 }
 
-EVENT_URL_RE = re.compile(r"https?://(?:www\.)?syrvenues\.com/events/20\d{2}/[A-Za-z0-9_\-]+", re.I)
-PERFORMANCE_RE = re.compile(
+EVENT_PATH_RE = re.compile(r"/events/20\d{2}/[A-Za-z0-9_\-]+", re.I)
+PERF_RE = re.compile(
     r"(?P<mon>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?\s+"
-    r"(?P<day>\d{1,2}),?\s+(?P<year>20\d{2})\s*(?:\||[-–—])?\s*"
+    r"(?P<day>\d{1,2}),?\s+(?P<year>20\d{2}).{0,20}?"
     r"(?P<hour>\d{1,2}):(?P<minute>\d{2})\s*(?P<ampm>AM|PM)",
     re.I,
 )
@@ -73,149 +71,107 @@ def uid_for(source, start, title):
 def normalize_event_url(value):
     if not value:
         return None
-    if value.startswith("/"):
-        value = urljoin(BASE, value)
-    m = EVENT_URL_RE.search(value)
-    return m.group(0).rstrip("/") if m else None
+    value = urljoin(BASE, value)
+    m = EVENT_PATH_RE.search(value)
+    return urljoin(BASE, m.group(0)).rstrip("/") if m else None
 
 
-def links_from_html(html):
+def event_links_from_location_html(html):
     links = set()
     soup = BeautifulSoup(html, "html.parser")
     for a in soup.find_all("a", href=True):
-        u = normalize_event_url(urljoin(BASE, a["href"]))
+        u = normalize_event_url(a["href"])
         if u:
             links.add(u)
-    for m in re.finditer(r"(?:https?://(?:www\.)?syrvenues\.com)?(/events/20\d{2}/[A-Za-z0-9_\-]+)", html, re.I):
-        u = normalize_event_url(urljoin(BASE, m.group(1)))
-        if u:
-            links.add(u)
-    return links
-
-
-def links_from_mirror(text):
-    links = set(EVENT_URL_RE.findall(text))
-    for m in re.finditer(r"\]\((/events/20\d{2}/[A-Za-z0-9_\-]+)\)", text, re.I):
-        links.add(urljoin(BASE, m.group(1)))
-    return {u.rstrip("/") for u in links}
-
-
-def discover_event_links():
-    links = set()
-    sources = [EVENTS_URL] + [cfg["page"] for cfg in VENUES.values()]
-    for source in sources:
-        direct_links = set()
-        try:
-            direct = fetch(source)
-            direct_links = links_from_html(direct)
-            links.update(direct_links)
-        except Exception as exc:
-            print(f"WARN direct discovery {source}: {exc}")
-        if not direct_links:
-            try:
-                mirrored = fetch_mirror(source)
-                found = links_from_mirror(mirrored)
-                links.update(found)
-                print(f"Mirror discovery {source}: {len(found)} links")
-            except Exception as exc:
-                print(f"WARN mirror discovery {source}: {exc}")
+    for m in EVENT_PATH_RE.finditer(html):
+        links.add(urljoin(BASE, m.group(0)).rstrip("/"))
     return sorted(links)
 
 
-def page_text(html):
-    return " ".join(BeautifulSoup(html, "html.parser").stripped_strings)
+def event_links_from_location_mirror(text):
+    links = set()
+    for m in EVENT_PATH_RE.finditer(text):
+        links.add(urljoin(BASE, m.group(0)).rstrip("/"))
+    return sorted(links)
 
 
-def title_from_content(content, is_html=True):
-    if is_html:
-        soup = BeautifulSoup(content, "html.parser")
-        h1 = soup.find("h1")
-        if h1:
-            return h1.get_text(" ", strip=True)
-    for line in content.splitlines():
+def discover_links_by_venue():
+    mapping = {"war": set(), "crouse": set()}
+    for venue, cfg in VENUES.items():
+        found = set()
+        try:
+            html = fetch(cfg["page"])
+            found.update(event_links_from_location_html(html))
+        except Exception as exc:
+            print(f"WARN direct venue discovery {venue}: {exc}")
+        if not found:
+            try:
+                text = fetch_mirror(cfg["page"])
+                found.update(event_links_from_location_mirror(text))
+            except Exception as exc:
+                print(f"WARN mirror venue discovery {venue}: {exc}")
+        mapping[venue].update(found)
+        print(f"Venue discovery {venue}: {len(found)} event links")
+    return mapping
+
+
+def title_from_html(html):
+    soup = BeautifulSoup(html, "html.parser")
+    h1 = soup.find("h1")
+    return h1.get_text(" ", strip=True) if h1 else None
+
+
+def title_from_mirror(text):
+    for line in text.splitlines():
         line = line.strip()
         if line.startswith("# "):
             return line[2:].strip()
     return None
 
 
-def venue_from_text(text):
-    low = text.lower()
-    for key, cfg in VENUES.items():
-        if any(n in low for n in cfg["needle"]):
-            return key
-    return None
+def page_text(html):
+    return " ".join(BeautifulSoup(html, "html.parser").stripped_strings)
 
 
 def parse_performances(text):
     starts = []
-    for m in PERFORMANCE_RE.finditer(text):
+    for m in PERF_RE.finditer(text):
         try:
-            dt = dtparse.parse(
-                f"{m.group('mon')} {m.group('day')} {m.group('year')} "
-                f"{m.group('hour')}:{m.group('minute')} {m.group('ampm')}"
-            ).replace(tzinfo=TZ)
-            starts.append(dt)
+            starts.append(
+                dtparse.parse(
+                    f"{m.group('mon')} {m.group('day')} {m.group('year')} "
+                    f"{m.group('hour')}:{m.group('minute')} {m.group('ampm')}"
+                ).replace(tzinfo=TZ)
+            )
         except Exception:
             pass
 
-    # Main Date:/Time: fields catch simple one-performance pages.
     if not starts:
         dm = re.search(r"Date:\s*([A-Za-z]{3,9}\.?\s+\d{1,2},?\s+20\d{2})", text, re.I)
-        tm = re.search(r"Time:\s*(\d{1,2}:\d{2}\s*(?:AM|PM))", text, re.I)
-        if dm and tm:
-            try:
-                starts.append(dtparse.parse(f"{dm.group(1)} {tm.group(1)}").replace(tzinfo=TZ))
-            except Exception:
-                pass
+        times = re.findall(r"(?:Time:\s*)?(\d{1,2}:\d{2}\s*(?:AM|PM))", text, re.I)
+        if dm and times:
+            for t in times[:8]:
+                try:
+                    starts.append(dtparse.parse(f"{dm.group(1)} {t}").replace(tzinfo=TZ))
+                except Exception:
+                    pass
 
     cutoff = datetime.now(TZ) - timedelta(days=2)
-    out = []
-    seen = set()
-    for dt in sorted(starts):
-        if dt < cutoff:
+    out, seen = [], set()
+    for start in sorted(starts):
+        if start < cutoff:
             continue
-        key = dt.isoformat()
-        if key not in seen:
-            seen.add(key)
-            out.append(dt)
+        key = start.isoformat()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(start)
     return out
 
 
-def parse_event_detail(url):
-    content = None
-    is_html = True
-    try:
-        content = fetch(url)
-    except Exception as exc:
-        print(f"WARN direct detail {url}: {exc}")
-    if content:
-        text = page_text(content)
-        title = title_from_content(content, True)
-        venue = venue_from_text(text)
-        starts = parse_performances(text)
-        if title and venue and starts:
-            return make_events(url, title, venue, starts)
-
-    try:
-        content = fetch_mirror(url)
-        is_html = False
-    except Exception as exc:
-        print(f"WARN mirror detail {url}: {exc}")
-        return []
-
-    text = " ".join(content.split())
-    title = title_from_content(content, is_html)
-    venue = venue_from_text(text)
-    starts = parse_performances(text)
-    if not title or not venue or not starts:
-        return []
-    return make_events(url, title, venue, starts)
-
-
 def make_events(url, title, venue, starts):
-    low_title = title.lower()
-    if "cancelled" in low_title or "canceled" in low_title or "postponed" in low_title:
+    low = title.lower()
+    if "cancelled" in low or "canceled" in low or "postponed" in low:
         return []
     return [
         {
@@ -228,6 +184,27 @@ def make_events(url, title, venue, starts):
         }
         for start in starts
     ]
+
+
+def parse_event_detail(url, venue):
+    try:
+        html = fetch(url)
+        title = title_from_html(html)
+        starts = parse_performances(page_text(html))
+        if title and starts:
+            return make_events(url, title, venue, starts)
+    except Exception as exc:
+        print(f"WARN direct detail {url}: {exc}")
+
+    try:
+        text = fetch_mirror(url)
+        title = title_from_mirror(text)
+        starts = parse_performances(" ".join(text.split()))
+        if title and starts:
+            return make_events(url, title, venue, starts)
+    except Exception as exc:
+        print(f"WARN mirror detail {url}: {exc}")
+    return []
 
 
 def parse_crunch_home_games(html):
@@ -253,10 +230,11 @@ def parse_crunch_home_games(html):
             continue
         if start < cutoff:
             continue
-        url_el = card.find("a", href=True)
-        source = urljoin(CRUNCH_SCHEDULE, url_el["href"]) if url_el else CRUNCH_SCHEDULE
+        a = card.find("a", href=True)
+        source = urljoin(CRUNCH_SCHEDULE, a["href"]) if a else CRUNCH_SCHEDULE
+        title = opponent if opponent.lower().startswith("syracuse") else f"Syracuse Crunch vs. {opponent}"
         events.append({
-            "title": f"Syracuse Crunch vs. {opponent}" if not opponent.lower().startswith("syracuse") else opponent,
+            "title": title,
             "start": start,
             "end": start + timedelta(hours=3),
             "url": source,
@@ -267,8 +245,7 @@ def parse_crunch_home_games(html):
 
 
 def dedupe(events):
-    out = []
-    seen = set()
+    out, seen = [], set()
     for e in sorted(events, key=lambda x: x["start"]):
         key = (e["venue"], e["start"].strftime("%Y%m%d%H%M"), re.sub(r"\W+", "", e["title"].lower()))
         if key in seen:
@@ -293,7 +270,6 @@ def build_ics(events, cal_name, prefix=None):
     ]
     for e in events:
         p = prefix if prefix is not None else VENUES[e["venue"]]["prefix"]
-        summary = p + e["title"]
         start_utc = e["start"].astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         end_utc = e["end"].astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         lines += [
@@ -302,7 +278,7 @@ def build_ics(events, cal_name, prefix=None):
             f"DTSTAMP:{now}",
             f"DTSTART:{start_utc}",
             f"DTEND:{end_utc}",
-            f"SUMMARY:{esc(summary)}",
+            f"SUMMARY:{esc(p + e['title'])}",
             f"LOCATION:{esc(e['location'])}",
             f"URL:{esc(e['url'])}",
             f"DESCRIPTION:{esc('Source: ' + e['url'])}",
@@ -321,16 +297,14 @@ def write(path, content):
 
 def main():
     events = []
-    links = discover_event_links()
-    print(f"Syracuse venue event detail links found: {len(links)}")
-    for link in links:
-        try:
-            parsed = parse_event_detail(link)
+    mapping = discover_links_by_venue()
+
+    for venue, links in mapping.items():
+        for link in sorted(links):
+            parsed = parse_event_detail(link, venue)
             if parsed:
-                print(f"  {link}: {len(parsed)} performance(s), venue={parsed[0]['venue']}")
+                print(f"{venue}: {link} -> {len(parsed)} performance(s)")
             events.extend(parsed)
-        except Exception as exc:
-            print(f"WARN {link}: {exc}")
 
     try:
         crunch = parse_crunch_home_games(fetch(CRUNCH_SCHEDULE))
@@ -342,7 +316,7 @@ def main():
     events = dedupe(events)
     war = [e for e in events if e["venue"] == "war"]
     crouse = [e for e in events if e["venue"] == "crouse"]
-    print(f"Parsed {len(war)} War Memorial and {len(crouse)} Crouse Hinds performances")
+    print(f"FINAL: {len(war)} War Memorial and {len(crouse)} Crouse Hinds performances")
 
     write(VENUES["war"]["outfile"], build_ics(war, "War Memorial", "War Memorial: "))
     write(VENUES["crouse"]["outfile"], build_ics(crouse, "Oncenter — Crouse Hinds Theater", "Oncenter: "))
