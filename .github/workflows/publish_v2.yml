@@ -1,6 +1,12 @@
 name: Build & Publish Syracuse Venue ICS v2
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'tm_venue_to_ics.py'
+      - 'requirements.txt'
+      - '.github/workflows/publish_v2.yml'
   workflow_dispatch: {}
   schedule:
     - cron: '17 */3 * * *'
